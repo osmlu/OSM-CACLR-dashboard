@@ -10,13 +10,15 @@ import logging
 import os
 from configparser import ConfigParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import TypedDict
+from typing import Generator, TypedDict
 from urllib.parse import quote
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from psycopg2.extensions import connection
 from psycopg2.pool import ThreadedConnectionPool
 from rich.logging import RichHandler
 
@@ -38,6 +40,49 @@ class Metric:
     title: str
     description: str
     sql: str
+
+    @classmethod
+    def from_file(cls, path: str | Path, include_dir: str) -> Metric:
+        """Parse metric properties and included snippets from a SQL file."""
+        path = Path(path)
+        slug = path.stem
+        with path.open(encoding="utf-8") as fh:
+            lines = fh.readlines()
+
+        title = slug.replace("_", " ").title()
+        description = "[No description]"
+        has_title = False
+        has_description = False
+        sql_lines: list[str] = []
+        header = True
+        for line in lines:
+            stripped = line.strip()
+            if stripped.lower().startswith("-- include"):
+                parts = stripped.split()
+                if len(parts) >= 3:
+                    inc_file = os.path.join(include_dir, parts[2])
+                    with open(inc_file, encoding="utf-8") as inc:
+                        sql_lines.append(inc.read())
+                header = False
+                continue
+            if header and stripped.startswith("--"):
+                comment = stripped[2:].strip()
+                lower = comment.lower()
+                if lower.startswith("title:"):
+                    title = comment.split(":", 1)[1].strip()
+                    has_title = True
+                elif lower.startswith("description:"):
+                    description = comment.split(":", 1)[1].strip()
+                    has_description = True
+                continue
+            header = False
+            sql_lines.append(line)
+
+        if not has_title or not has_description:
+            raise ValueError(f"{path.name} missing title or description")
+
+        sql = "".join(sql_lines).strip()
+        return cls(slug=slug, title=title, description=description, sql=sql)
 
 
 class MetricGraph(TypedDict):
@@ -67,54 +112,12 @@ class DashboardMetric(TypedDict):
     details: MetricDetails | None
 
 
-# pylint: disable-next=too-many-locals
 def load_metrics(metric_dir: str, include_dir: str) -> list[Metric]:
     """Load metrics from sql files."""
     metrics: list[Metric] = []
     pattern = os.path.join(metric_dir, "**", "*.sql")
     for path in sorted(glob.glob(pattern, recursive=True)):
-        slug = os.path.splitext(os.path.basename(path))[0]
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.readlines()
-
-        title = slug.replace("_", " ").title()
-        description = "[No description]"
-        has_title = False
-        has_description = False
-        sql_lines: list[str] = []
-        header = True
-        for line in lines:
-            stripped = line.strip()
-            if stripped.lower().startswith("-- include"):
-                parts = stripped.split()
-                if len(parts) >= 3:
-                    inc_file = os.path.join(include_dir, parts[2])
-                    with open(inc_file, encoding="utf-8") as inc:
-                        sql_lines.append(inc.read())
-                header = False
-                continue
-            if header and stripped.startswith("--"):
-                comment = stripped[2:].strip()
-                lower = comment.lower()
-                if lower.startswith("title:"):
-                    title = comment.split(":", 1)[1].strip()
-                    has_title = True
-                elif lower.startswith("description:"):
-                    description = comment.split(":", 1)[1].strip()
-                    has_description = True
-                else:
-                    # ignore other comment lines in header
-                    pass
-                continue
-            header = False
-            sql_lines.append(line)
-
-        if not has_title or not has_description:
-            raise ValueError(f"{os.path.basename(path)} missing title or description")
-
-        sql = "".join(sql_lines).strip()
-
-        metrics.append(Metric(slug=slug, title=title, description=description, sql=sql))
+        metrics.append(Metric.from_file(path, include_dir))
     return metrics
 
 
@@ -219,17 +222,23 @@ class Dashboard:  # pylint: disable=too-few-public-methods
         )
         self.pool.closeall()
 
-    def _fetch_rows(self: Dashboard, sql: str) -> tuple[list[tuple], list[str]]:
+    @contextmanager
+    def _get_connection(self: Dashboard) -> Generator[connection, None, None]:
+        """Context manager for safely getting and releasing connections from the pool."""
         conn = self.pool.getconn()
         try:
+            yield conn
+        finally:
+            self.pool.putconn(conn)
+
+    def _fetch_rows(self: Dashboard, sql: str) -> tuple[list[tuple], list[str]]:
+        with self._get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql)
                 rows = cur.fetchall()
                 if cur.description is None:
                     raise RuntimeError("metric query returned no columns")
                 headers = [column.name for column in cur.description]
-        finally:
-            self.pool.putconn(conn)
         return rows, headers
 
     def _convert_rows(self: Dashboard, rows: list[tuple]) -> list[tuple]:
