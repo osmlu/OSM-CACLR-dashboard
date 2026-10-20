@@ -1,12 +1,13 @@
 -- Title: CACLR mismatch
--- Description: Addresses tagged with ref:caclr where the street or city differs from the official record
+-- Description: Addresses tagged with ref:caclr where the housenumber, street, or city differs from the official record
 -- include osm_potential_addresses.sql
 SELECT
     opa.osm_id,
     opa.osm_type,
     opa.url,
     opa.josmuid,
-    opa."addr:housenumber",
+    opa."addr:housenumber" AS osm_housenumber,
+    a.numero AS caclr_housenumber,
     opa."addr:street" AS osm_street,
     a.rue AS caclr_street,
     opa."addr:city" AS osm_city,
@@ -21,7 +22,8 @@ INNER JOIN addresses AS a
 LEFT JOIN immeuble AS i
     ON opa."ref:caclr" = i.numero_interne::text
 WHERE
-    opa."addr:street" != a.rue
+    opa."addr:housenumber" != a.numero
+    OR opa."addr:street" != a.rue
     OR opa."addr:city" != a.localite
 ORDER BY
     a.localite,
